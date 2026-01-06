@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/apps}"
+STATE_DIR="${BACKUP_DIR}/.backup-app-state"
+HELP_FILE="/usr/local/share/backup-app/USAGE.txt"
+
+# --- Colors (disable if not a TTY) -------------------------------------------
+if [[ -t 2 ]]; then
+  RED=$'\033[31m'
+  BOLD=$'\033[1m'
+  RESET=$'\033[0m'
+else
+  RED=""; BOLD=""; RESET=""
+fi
+
+usage() {
+  if [[ -r "$HELP_FILE" ]]; then
+    cat "$HELP_FILE"
+  else
+    cat <<'EOF'
+backup-app — Versioned backup utility
+
+Usage:
+  sudo backup-app {major|minor} +/absolute/target/dir [-/absolute/path/to/exclude ...]
+  backup-app list
+  backup-app list <appname>
+  backup-app check <absolute-path>
+  backup-app help
+EOF
+  fi
+}
+
+die_usage() {
+  if [[ $# -gt 0 ]]; then
+    echo "${RED}ERROR:${RESET} $*" >&2
+  fi
+  usage >&2
+  exit 2
+}
+
+require_writable_backup_dir() {
+  # Ensure BACKUP_DIR exists and is writable; if not, produce a clear message.
+  mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+
+  if [[ ! -d "$BACKUP_DIR" ]]; then
+    die_usage "Backup directory '$BACKUP_DIR' does not exist and could not be created."
+  fi
+
+  if [[ ! -w "$BACKUP_DIR" ]]; then
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+      die_usage "Backup directory '$BACKUP_DIR' is not writable. Please run this command with sudo (or set BACKUP_DIR to a writable location)."
+    else
+      die_usage "Backup directory '$BACKUP_DIR' is not writable by root. Check permissions/ACLs."
+    fi
+  fi
+}
+
+# --- Helpers ----------------------------------------------------------------
+
+fmt_date() {
+  local d="$1"
+  [[ "$d" =~ ^[0-9]{8}$ ]] || { echo "$d"; return; }
+  echo "${d:0:4}-${d:4:2}-${d:6:2}"
+}
+
+parse_archive_name() {
+  # Parse archive filename of form: <app>-<version>_<YYYYMMDD>.tar.gz
+  # Output: app version date8
+  local base="$1"
+  [[ "$base" == *.tar.gz ]] || return 0
+  base="${base%.tar.gz}"
+
+  local date8="${base##*_}"
+  local left="${base%_*}"
+  [[ "$date8" =~ ^[0-9]{8}$ ]] || return 0
+
+  local version="${left##*-}"
+  local app="${left%-*}"
+  [[ "$version" =~ ^[0-9]+\.[0-9]+$ ]] || return 0
+  [[ -n "$app" ]] || return 0
+
+  echo "$app $version $date8"
+}
+
+# --- List commands -----------------------------------------------------------
+
+list_all_apps() {
+  [[ -d "$BACKUP_DIR" ]] || exit 0
+  shopt -s nullglob
+
+  declare -A latest=()
+  local f base parsed app date8
+
+  for f in "$BACKUP_DIR"/*.tar.gz; do
+    base="$(basename "$f")"
+    parsed="$(parse_archive_name "$base" || true)"
+    [[ -n "$parsed" ]] || continue
+    app="$(awk '{print $1}' <<<"$parsed")"
+    date8="$(awk '{print $3}' <<<"$parsed")"
+    [[ -z "${latest[$app]:-}" || "$date8" > "${latest[$app]}" ]] && latest["$app"]="$date8"
+  done
+
+  for app in "${!latest[@]}"; do
+    printf "%s %s\n" "${app^}" "$(fmt_date "${latest[$app]}")"
+  done | sort
+}
+
+list_app_backups() {
+  local want="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  [[ -n "$want" ]] || die_usage "Missing app name for list."
+
+  [[ -d "$BACKUP_DIR" ]] || exit 0
+  shopt -s nullglob
+
+  local f base parsed app ver date8
+  local lines=()
+
+  for f in "$BACKUP_DIR"/*.tar.gz; do
+    base="$(basename "$f")"
+    parsed="$(parse_archive_name "$base" || true)"
+    [[ -n "$parsed" ]] || continue
+
+    app="$(awk '{print $1}' <<<"$parsed")"
+    ver="$(awk '{print $2}' <<<"$parsed")"
+    date8="$(awk '{print $3}' <<<"$parsed")"
+
+    [[ "$(echo "$app" | tr '[:upper:]' '[:lower:]')" == "$want" ]] || continue
+    lines+=( "$date8 $ver" )
+  done
+
+  # If no backups found, output nothing (quiet) and exit success.
+  [[ "${#lines[@]}" -gt 0 ]] || exit 0
+
+  printf "%s\n" "${lines[@]}" \
+    | sort -k1,1 -k2,2V \
+    | awk '{printf "%s %s-%s-%s\n", $2, substr($1,1,4), substr($1,5,2), substr($1,7,2)}'
+}
+
+# --- Check command -----------------------------------------------------------
+
+check_directory() {
+  local path="${1:-}"
+
+  [[ -n "$path" ]] || die_usage "Missing path for check."
+  [[ "$path" == /* ]] || die_usage "Path must be absolute: $path"
+
+  path="${path%/}"
+  [[ -d "$path" ]] || die_usage "Directory does not exist: $path"
+
+  # List top-level directories without a '.' prefix, names only.
+  find "$path" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+    | grep -v '^\.' \
+    | sort
+}
+
+# --- Backup logic ------------------------------------------------------------
+
+get_last_version() {
+  local version_file="$1"
+  if [[ -f "$version_file" ]]; then
+    head -n 1 "$version_file" | tr -d '[:space:]'
+  else
+    echo "0.0"
+  fi
+}
+
+validate_version() {
+  local v="$1"
+  [[ "$v" =~ ^[0-9]+\.[0-9]+$ ]] || die_usage "Invalid version format: '$v' (expected X.Y)"
+}
+
+bump_version() {
+  local action="$1"
+  local current="$2"
+  local major minor
+  major="${current%%.*}"
+  minor="${current##*.}"
+
+  if [[ "$action" == "major" ]]; then
+    major=$((major + 1))
+    minor=0
+  else
+    minor=$((minor + 1))
+  fi
+
+  echo "${major}.${minor}"
+}
+
+run_backup() {
+  local action="$1"; shift
+
+  require_writable_backup_dir
+  mkdir -p "$STATE_DIR"
+
+  local target=""
+  local excludes=()
+
+  for arg in "$@"; do
+    if [[ "$arg" == +* ]]; then
+      target="${arg:1}"
+      continue
+    fi
+    if [[ "$arg" == -* ]]; then
+      excludes+=( "${arg:1}" )
+      continue
+    fi
+    die_usage "Unrecognized argument: '$arg'"
+  done
+
+  [[ -n "$target" ]] || die_usage "Missing +TARGET."
+  [[ "$target" == /* ]] || die_usage "+TARGET must be an absolute path: '$target'"
+
+  target="${target%/}"
+  [[ -d "$target" ]] || die_usage "Target directory does not exist: $target"
+
+  local app
+  app="$(basename "$target")"
+
+  local version_file="${STATE_DIR}/${app}.version"
+  local current next
+  current="$(get_last_version "$version_file")"
+  validate_version "$current"
+  next="$(bump_version "$action" "$current")"
+
+  local date8 out
+  date8="$(date +%Y%m%d)"
+  out="${BACKUP_DIR}/${app}-${next}_${date8}.tar.gz"
+
+  [[ -e "$out" ]] && die_usage "Backup already exists: $out"
+
+  local flags=()
+  local ex ex_norm
+  for ex in "${excludes[@]}"; do
+    [[ "$ex" == /* ]] || die_usage "-EXCLUDE must be an absolute path: '$ex'"
+    ex_norm="${ex%/}"
+    # Must be under target (nested allowed)
+    if [[ -e "$ex_norm" ]]; then
+      local ex_real target_real
+      target_real="$(realpath "$target")"
+      ex_real="$(realpath "$ex_norm")"
+      [[ "$ex_real" == "$target_real"* ]] || die_usage "Exclude not under target: $ex_norm"
+    else
+      [[ "$ex_norm" == "$target/"* ]] || die_usage "Exclude not under target: $ex_norm"
+    fi
+    flags+=( "--exclude=${ex_norm#/}" )
+  done
+
+  echo "${BOLD}Action:${RESET}     $action"
+  echo "${BOLD}App:${RESET}        $app"
+  echo "${BOLD}Version:${RESET}    $current → $next"
+  echo "${BOLD}Output:${RESET}     $out"
+  echo
+
+  tar -czf "$out" -C / "${flags[@]}" "${target#/}"
+  echo "$next" > "$version_file"
+  echo "Backup created successfully."
+}
+
+# --- Main --------------------------------------------------------------------
+
+CMD="${1:-}"
+
+case "$CMD" in
+  help)
+    usage
+    exit 0
+    ;;
+  list)
+    if [[ $# -eq 1 ]]; then
+      list_all_apps
+    elif [[ $# -eq 2 ]]; then
+      list_app_backups "${2:-}"
+    else
+      die_usage "Too many arguments for list. Use: backup-app list [appname]"
+    fi
+    ;;
+  check)
+    shift
+    check_directory "${1:-}"
+    ;;
+  major|minor)
+    shift
+    run_backup "$CMD" "$@"
+    ;;
+  *)
+    die_usage "Missing or invalid command. Expected major, minor, list, check, or help."
+    ;;
+esac
