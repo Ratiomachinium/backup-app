@@ -1,0 +1,96 @@
+backup-app — Versioned backup utility (major / minor / list)
+
+USAGE
+  sudo backup-app {major|minor} +/absolute/target/dir [-/absolute/path/to/exclude ...]
+  sudo backup-app list
+  sudo backup-app list <appname>
+
+ARGUMENTS
+
+  major | minor
+    Required for backup operations.
+    - major: increments X.Y → (X+1).0
+    - minor: increments X.Y → X.(Y+1)
+
+  +TARGET
+    Required for major/minor.
+    Absolute path to the directory to back up.
+    Example:
+      +/home/[username]/[folder-to-back-up]
+
+  -EXCLUDE
+    Optional.
+    Zero or more absolute paths to exclude.
+    Each exclusion MUST be inside +TARGET.
+    Nested exclusions are allowed.
+    Examples:
+      -/home/[username]/[folder-to-back-up]/data
+      -/home/[username]/[folder-to-back-up]/cache/tmp
+
+COMMANDS
+
+  backup-app list
+    Lists all backed-up applications.
+    Output format:
+      <AppName> <LastBackupDate YYYY-MM-DD>
+
+  backup-app list <appname>
+    Lists all backups for a specific application.
+    Output format:
+      <Version> <BackupDate YYYY-MM-DD>
+      
+  backup-app check <absolute-path>
+    Lists top-level directories under the given path.
+    Hidden directories (starting with '.') are excluded.
+    Output is names only.
+
+EXAMPLES
+
+  Major backup of the "newsletters" app:
+    sudo backup-app major +/home/myusername/newsletters
+
+  Minor backup excluding runtime data:
+    sudo backup-app minor +/home/myusername/newsletters \
+      -/home/myusername/newsletters/data
+
+  Multiple exclusions:
+    sudo backup-app minor +/home/myusername/newsletters \
+      -/home/myusername/newsletters/data \
+      -/home/myusername/newsletters/cache/tmp
+
+  List all applications with backups:
+    backup-app list
+
+  List all backups for newsletters:
+    backup-app list newsletters
+    
+  Check top level folders within directory
+    backup-app check /home/myusername
+
+NOTES
+
+  - Backups are stored in:
+      /var/backups/apps
+
+  - Version state is stored in:
+      /var/backups/apps/.backup-app-state/<app>.version
+
+  - Backup archive format:
+      <app>-<version>_<YYYYMMDD>.tar.gz
+
+ERROR CASES
+
+  - Missing command:
+      backup-app
+
+  - Invalid command:
+      backup-app djdjd
+
+  - Missing +TARGET:
+      backup-app minor
+
+  - Multiple +TARGET arguments:
+      backup-app minor +/a +/b
+
+  - Exclude not under target:
+      backup-app minor +/home/user/app -/etc
